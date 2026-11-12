@@ -5,12 +5,14 @@ This service is the only AI integration point for the web app.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 
 from detector import UnavailableDetector, YoloV8Detector, get_detector
 
@@ -20,6 +22,7 @@ if not os.environ.get("YOLO_WEIGHTS_PATH") and os.path.exists(DEFAULT_MODEL_PATH
     os.environ["YOLO_WEIGHTS_PATH"] = DEFAULT_MODEL_PATH
 
 detector = get_detector()
+inference_lock = asyncio.Lock()
 
 
 def _parse_gps_track(gps_track: str | None, latitude: float | None, longitude: float | None) -> list[dict[str, Any]] | None:
@@ -78,7 +81,8 @@ async def detect_image_endpoint(
     if isinstance(detector, UnavailableDetector):
         raise HTTPException(status_code=503, detail="YOLO weights are unavailable; inference is disabled.")
     payload = await file.read()
-    detections = detector.detect_image(payload, lat=lat, lng=lng)
+    async with inference_lock:
+        detections = await run_in_threadpool(detector.detect_image, payload, lat=lat, lng=lng)
     return {"detections": detections, "source": "image"}
 
 
@@ -102,7 +106,8 @@ async def detect_video_endpoint(
         raise HTTPException(status_code=503, detail="YOLO weights are unavailable; inference is disabled.")
     payload = await file.read()
     track = _parse_gps_track(gps_track, latitude, longitude)
-    detections = detector.detect_video(payload, gps_track=track)
+    async with inference_lock:
+        detections = await run_in_threadpool(detector.detect_video, payload, gps_track=track)
     return {"detections": detections, "source": "video"}
 
 
