@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+from time import perf_counter
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -23,6 +25,18 @@ if not os.environ.get("YOLO_WEIGHTS_PATH") and os.path.exists(DEFAULT_MODEL_PATH
 
 detector = get_detector()
 inference_lock = asyncio.Lock()
+logger = logging.getLogger("uvicorn.error")
+
+
+def _process_rss_mb() -> float | None:
+    try:
+        with open("/proc/self/status", encoding="ascii") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
 
 
 def _parse_gps_track(gps_track: str | None, latitude: float | None, longitude: float | None) -> list[dict[str, Any]] | None:
@@ -78,11 +92,41 @@ async def detect_image_endpoint(
     lat: float | None = Form(default=None),
     lng: float | None = Form(default=None),
 ) -> dict[str, Any]:
+    request_started = perf_counter()
+    payload_size = 0
+    inference_started: float | None = None
+    logger.info("image_detection_request_started rss_mb=%s", _process_rss_mb())
     if isinstance(detector, UnavailableDetector):
         raise HTTPException(status_code=503, detail="YOLO weights are unavailable; inference is disabled.")
-    payload = await file.read()
-    async with inference_lock:
-        detections = await run_in_threadpool(detector.detect_image, payload, lat=lat, lng=lng)
+    try:
+        payload = await file.read()
+        payload_size = len(payload)
+        logger.info("image_upload_received bytes=%d rss_mb=%s", payload_size, _process_rss_mb())
+        async with inference_lock:
+            inference_started = perf_counter()
+            logger.info("image_inference_started rss_mb=%s", _process_rss_mb())
+            detections = await run_in_threadpool(detector.detect_image, payload, lat=lat, lng=lng)
+        inference_seconds = perf_counter() - inference_started
+        handler_seconds = perf_counter() - request_started
+        logger.info(
+            "image_inference_completed detections=%d inference_seconds=%.3f handler_seconds=%.3f rss_mb=%s",
+            len(detections),
+            inference_seconds,
+            handler_seconds,
+            _process_rss_mb(),
+        )
+    except Exception:
+        inference_seconds = (
+            f"{perf_counter() - inference_started:.3f}" if inference_started is not None else "not_started"
+        )
+        logger.exception(
+            "image_detection_failed upload_bytes=%d inference_seconds=%s handler_seconds=%.3f rss_mb=%s",
+            payload_size,
+            inference_seconds,
+            perf_counter() - request_started,
+            _process_rss_mb(),
+        )
+        raise
     return {"detections": detections, "source": "image"}
 
 
